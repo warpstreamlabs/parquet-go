@@ -1131,7 +1131,7 @@ func (w *writer) writeFileFooter() error {
 		CreatedBy:        w.createdBy,
 		ColumnOrders:     w.columnOrders,
 	}
-	footer, err := thrift.Marshal(new(thrift.CompactProtocol), w.fileMetaData)
+	footer, err := thrift.Marshal(protocol, w.fileMetaData)
 	if err != nil {
 		return err
 	}

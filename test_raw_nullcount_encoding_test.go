@@ -7,15 +7,16 @@ import (
 	"os"
 	"testing"
 
+	"slices"
+
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/encoding/thrift"
-	"slices"
 )
 
 // TestRawNullCountEncoding reads a parquet file and manually inspects the raw
 // thrift encoding to determine if NullCount fields are present or omitted.
 func TestRawNullCountEncoding(t *testing.T) {
-	filePath := "warpstream__tableflow_75047345156a575d_unpartitioned__tableflow_datagen_json_0_v0-42d3e1c0-bf75-4d32-a7f5-1dd006f4a96f_data_00088978483958872834.parquet"
+	filePath := "warpstream__tableflow_75047345156a575d_unpartitioned__tableflow_datagen_json_0_v0-df956f6a-f9b0-4495-9480-55ed80319f54_data_00000941130244846770.parquet"
 
 	// Check if file exists
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
