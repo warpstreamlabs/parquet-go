@@ -17,10 +17,10 @@ func TestMarshalUnmarshalSchemaMetadata(t *testing.T) {
 				Name: "hello",
 			},
 		},
-		RowGroups:            []format.RowGroup{},
-		KeyValueMetadata:     []format.KeyValue{},
-		CreatedBy:            "",
-		ColumnOrders:         []format.ColumnOrder{},
+		RowGroups:                []format.RowGroup{},
+		KeyValueMetadata:         []format.KeyValue{},
+		CreatedBy:                "",
+		ColumnOrders:             []format.ColumnOrder{},
 		FooterSigningKeyMetadata: []byte{},
 	}
 

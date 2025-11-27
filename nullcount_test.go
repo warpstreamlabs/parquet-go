@@ -60,4 +60,3 @@ func TestNullCountAlwaysWritten(t *testing.T) {
 		}
 	}
 }
-
