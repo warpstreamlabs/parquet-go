@@ -99,4 +99,3 @@ func extractFooterSize(fileBytes []byte) int32 {
 		int32(fileBytes[len(fileBytes)-6])<<16 |
 		int32(fileBytes[len(fileBytes)-5])<<24
 }
-
