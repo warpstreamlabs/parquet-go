@@ -225,12 +225,11 @@ type WriterConfig struct {
 	Schema                  *Schema
 	BloomFilters            []BloomFilterColumn
 	Compression             compress.Codec
-	Sorting                 SortingConfig
-	SkipPageBounds          [][]string
-	Encodings               map[Kind]encoding.Encoding
-	DictionaryMaxBytes      int64
-	SchemaConfig            *SchemaConfig
-	WriteZeroOptionalFields bool
+	Sorting            SortingConfig
+	SkipPageBounds     [][]string
+	Encodings          map[Kind]encoding.Encoding
+	DictionaryMaxBytes int64
+	SchemaConfig       *SchemaConfig
 }
 
 // DefaultWriterConfig returns a new WriterConfig value initialized with the
@@ -241,12 +240,11 @@ func DefaultWriterConfig() *WriterConfig {
 		ColumnPageBuffers:       &defaultColumnBufferPool,
 		ColumnIndexSizeLimit:    DefaultColumnIndexSizeLimit,
 		PageBufferSize:          DefaultPageBufferSize,
-		WriteBufferSize:         DefaultWriteBufferSize,
-		DataPageVersion:         DefaultDataPageVersion,
-		DataPageStatistics:      DefaultDataPageStatistics,
-		MaxRowsPerRowGroup:      DefaultMaxRowsPerRowGroup,
-		SchemaConfig:            DefaultSchemaConfig(),
-		WriteZeroOptionalFields: false,
+		WriteBufferSize:    DefaultWriteBufferSize,
+		DataPageVersion:    DefaultDataPageVersion,
+		DataPageStatistics: DefaultDataPageStatistics,
+		MaxRowsPerRowGroup: DefaultMaxRowsPerRowGroup,
+		SchemaConfig:       DefaultSchemaConfig(),
 		Sorting: SortingConfig{
 			SortingBuffers: &defaultSortingBufferPool,
 		},
@@ -301,12 +299,11 @@ func (c *WriterConfig) ConfigureWriter(config *WriterConfig) {
 		KeyValueMetadata:        keyValueMetadata,
 		Schema:                  coalesceSchema(c.Schema, config.Schema),
 		BloomFilters:            coalesceBloomFilters(c.BloomFilters, config.BloomFilters),
-		Compression:             coalesceCompression(c.Compression, config.Compression),
-		Sorting:                 coalesceSortingConfig(c.Sorting, config.Sorting),
-		SkipPageBounds:          coalesceSkipPageBounds(c.SkipPageBounds, config.SkipPageBounds),
-		Encodings:               encodings,
-		SchemaConfig:            coalesceSchemaConfig(c.SchemaConfig, config.SchemaConfig),
-		WriteZeroOptionalFields: coalesceBool(c.WriteZeroOptionalFields, config.WriteZeroOptionalFields),
+		Compression:    coalesceCompression(c.Compression, config.Compression),
+		Sorting:        coalesceSortingConfig(c.Sorting, config.Sorting),
+		SkipPageBounds: coalesceSkipPageBounds(c.SkipPageBounds, config.SkipPageBounds),
+		Encodings:      encodings,
+		SchemaConfig:   coalesceSchemaConfig(c.SchemaConfig, config.SchemaConfig),
 	}
 }
 
@@ -691,17 +688,6 @@ func SkipPageBounds(path ...string) WriterOption {
 	return writerOption(func(config *WriterConfig) { config.SkipPageBounds = append(config.SkipPageBounds, path) })
 }
 
-// WriteZeroOptionalFields creates a configuration option which forces the writer
-// to always encode optional thrift fields even when they have zero values.
-// This is useful for compatibility with systems like Snowflake that require
-// explicit null counts in statistics even when they are zero.
-//
-// Defaults to false (zero-valued optional fields are omitted).
-func WriteZeroOptionalFields(enabled bool) WriterOption {
-	return writerOption(func(config *WriterConfig) {
-		config.WriteZeroOptionalFields = enabled
-	})
-}
 
 // DefaultEncodingFor creates a configuration option which sets the default encoding
 // used by a writer for columns with the specified primitive type where none were defined.

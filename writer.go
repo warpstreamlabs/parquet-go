@@ -751,14 +751,7 @@ func newWriterRowGroup(w *writer, config *WriterConfig) *writerRowGroup {
 			dictionaryMaxBytes: config.DictionaryMaxBytes,
 		}
 
-		// Configure protocol features based on writer options
 		c.header.protocol = &thrift.CompactProtocol{}
-		if config.WriteZeroOptionalFields {
-			c.header.protocol.SetFeatures(thrift.UseDeltaEncoding |
-				thrift.CoalesceBoolFields |
-				thrift.WriteZeroOptionalFields)
-		}
-
 		c.header.encoder.Reset(c.header.protocol.NewWriter(&c.buffers.header))
 
 		if leaf.maxDefinitionLevel > 0 {
@@ -921,9 +914,8 @@ type writer struct {
 	writer          offsetTrackingWriter
 	currentRowGroup *writerRowGroup
 
-	createdBy               string
-	metadata                []format.KeyValue
-	writeZeroOptionalFields bool
+	createdBy string
+	metadata  []format.KeyValue
 
 	columnOrders   []format.ColumnOrder
 	schemaElements []format.SchemaElement
@@ -944,7 +936,6 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
 		w.writer.Reset(w.buffer)
 	}
 	w.createdBy = config.CreatedBy
-	w.writeZeroOptionalFields = config.WriteZeroOptionalFields
 	w.metadata = make([]format.KeyValue, 0, len(config.KeyValueMetadata))
 	for k, v := range config.KeyValueMetadata {
 		w.metadata = append(w.metadata, format.KeyValue{Key: k, Value: v})
@@ -1078,13 +1069,7 @@ func (w *writer) writeFileFooter() error {
 	// because the parquet format is backward compatible in this case. Older
 	// readers will simply ignore this section since they do not know how to
 	// decode its content, nor have loaded any metadata to reference it.
-	protocol := &thrift.CompactProtocol{}
-	if w.writeZeroOptionalFields {
-		protocol.SetFeatures(thrift.UseDeltaEncoding |
-			thrift.CoalesceBoolFields |
-			thrift.WriteZeroOptionalFields)
-	}
-	encoder := thrift.NewEncoder(protocol.NewWriter(&w.writer))
+	encoder := thrift.NewEncoder(new(thrift.CompactProtocol).NewWriter(&w.writer))
 
 	for i, columnIndexes := range w.columnIndexes {
 		rowGroup := &w.rowGroups[i]
@@ -1131,7 +1116,7 @@ func (w *writer) writeFileFooter() error {
 		CreatedBy:        w.createdBy,
 		ColumnOrders:     w.columnOrders,
 	}
-	footer, err := thrift.Marshal(protocol, w.fileMetaData)
+	footer, err := thrift.Marshal(new(thrift.CompactProtocol), w.fileMetaData)
 	if err != nil {
 		return err
 	}

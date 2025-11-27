@@ -16,10 +16,6 @@ const (
 	// CoalesceBoolFields is advertised by protocols that allow encoders to
 	// coalesce boolean values into field types.
 	CoalesceBoolFields
-
-	// WriteZeroOptionalFields is advertised by protocols that allow encoders to
-	// write optional fields even when they have zero values.
-	WriteZeroOptionalFields
 )
 
 // The Protocol interface abstracts the creation of low-level thrift readers and
