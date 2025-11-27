@@ -1068,7 +1068,8 @@ func (w *writer) writeFileFooter() error {
 	// because the parquet format is backward compatible in this case. Older
 	// readers will simply ignore this section since they do not know how to
 	// decode its content, nor have loaded any metadata to reference it.
-	encoder := thrift.NewEncoder(new(thrift.CompactProtocol).NewWriter(&w.writer))
+	protocol := new(thrift.CompactProtocol)
+	encoder := thrift.NewEncoder(protocol.NewWriter(&w.writer))
 
 	for i, columnIndexes := range w.columnIndexes {
 		rowGroup := &w.rowGroups[i]
