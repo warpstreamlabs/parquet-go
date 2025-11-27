@@ -14,9 +14,7 @@ import (
 // CompactProtocol is a Protocol implementation for the compact thrift protocol.
 //
 // https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md#integer-encoding
-type CompactProtocol struct {
-	features Features
-}
+type CompactProtocol struct{}
 
 func (p *CompactProtocol) NewReader(r io.Reader) Reader {
 	return &compactReader{protocol: p, binary: binaryReader{r: r}}
@@ -27,15 +25,7 @@ func (p *CompactProtocol) NewWriter(w io.Writer) Writer {
 }
 
 func (p *CompactProtocol) Features() Features {
-	if p.features == 0 {
-		return UseDeltaEncoding | CoalesceBoolFields
-	}
-	return p.features
-}
-
-// SetFeatures configures the protocol features.
-func (p *CompactProtocol) SetFeatures(features Features) {
-	p.features = features
+	return UseDeltaEncoding | CoalesceBoolFields
 }
 
 type compactReader struct {

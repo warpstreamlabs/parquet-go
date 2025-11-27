@@ -751,7 +751,6 @@ func newWriterRowGroup(w *writer, config *WriterConfig) *writerRowGroup {
 			dictionaryMaxBytes: config.DictionaryMaxBytes,
 		}
 
-		c.header.protocol = &thrift.CompactProtocol{}
 		c.header.encoder.Reset(c.header.protocol.NewWriter(&c.buffers.header))
 
 		if leaf.maxDefinitionLevel > 0 {
@@ -1404,7 +1403,7 @@ type ColumnWriter struct {
 	buffers *writerBuffers
 
 	header struct {
-		protocol *thrift.CompactProtocol
+		protocol thrift.CompactProtocol
 		encoder  thrift.Encoder
 	}
 
