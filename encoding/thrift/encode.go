@@ -278,7 +278,10 @@ encodeFields:
 			}
 		}
 
-		if !f.flags.have(required) && x.IsZero() {
+		// Always write optional fields for regular structs, even if zero-valued.
+		// This ensures fields like NullCount=0 are present in Parquet statistics.
+		// However, unions must skip zero values to maintain exactly one field.
+		if !f.flags.have(required) && x.IsZero() && enc.union {
 			continue encodeFields
 		}
 

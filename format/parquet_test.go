@@ -17,7 +17,11 @@ func TestMarshalUnmarshalSchemaMetadata(t *testing.T) {
 				Name: "hello",
 			},
 		},
-		RowGroups: []format.RowGroup{},
+		RowGroups:                []format.RowGroup{},
+		KeyValueMetadata:         []format.KeyValue{},
+		CreatedBy:                "",
+		ColumnOrders:             []format.ColumnOrder{},
+		FooterSigningKeyMetadata: []byte{},
 	}
 
 	b, err := thrift.Marshal(protocol, metadata)
