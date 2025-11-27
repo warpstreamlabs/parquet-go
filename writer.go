@@ -921,8 +921,9 @@ type writer struct {
 	writer          offsetTrackingWriter
 	currentRowGroup *writerRowGroup
 
-	createdBy string
-	metadata  []format.KeyValue
+	createdBy               string
+	metadata                []format.KeyValue
+	writeZeroOptionalFields bool
 
 	columnOrders   []format.ColumnOrder
 	schemaElements []format.SchemaElement
@@ -943,6 +944,7 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
 		w.writer.Reset(w.buffer)
 	}
 	w.createdBy = config.CreatedBy
+	w.writeZeroOptionalFields = config.WriteZeroOptionalFields
 	w.metadata = make([]format.KeyValue, 0, len(config.KeyValueMetadata))
 	for k, v := range config.KeyValueMetadata {
 		w.metadata = append(w.metadata, format.KeyValue{Key: k, Value: v})
@@ -1076,7 +1078,12 @@ func (w *writer) writeFileFooter() error {
 	// because the parquet format is backward compatible in this case. Older
 	// readers will simply ignore this section since they do not know how to
 	// decode its content, nor have loaded any metadata to reference it.
-	protocol := new(thrift.CompactProtocol)
+	protocol := &thrift.CompactProtocol{}
+	if w.writeZeroOptionalFields {
+		protocol.SetFeatures(thrift.UseDeltaEncoding |
+			thrift.CoalesceBoolFields |
+			thrift.WriteZeroOptionalFields)
+	}
 	encoder := thrift.NewEncoder(protocol.NewWriter(&w.writer))
 
 	for i, columnIndexes := range w.columnIndexes {

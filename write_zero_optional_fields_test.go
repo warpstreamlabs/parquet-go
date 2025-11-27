@@ -410,4 +410,3 @@ func getColumnStatistics(t *testing.T, file *parquet.File, columnIndex int) form
 
 	return rowGroup.Columns[columnIndex].MetaData.Statistics
 }
-
