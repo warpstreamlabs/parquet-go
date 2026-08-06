@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -1488,6 +1489,83 @@ func TestReadFileWithNullColumns(t *testing.T) {
 	}
 }
 
+// TestWriteFileWithNullColumns tests writing parquet files with NULL-type columns.
+// This test verifies the fix for the issue where parquet-go could read NULL-type columns
+// (from PyArrow-generated files) but could not write them.
+//
+// Reproduces: https://github.com/parquet-go/parquet-go/issues/517
+func TestWriteFileWithNullColumns(t *testing.T) {
+	// Read the existing test file with NULL columns
+	rows, err := parquet.ReadFile[any]("testdata/null_columns.parquet")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := []any{
+		map[string]any{"name": "test1", "value": nil},
+		map[string]any{"name": "test2", "value": nil},
+		map[string]any{"name": "test3", "value": nil},
+		map[string]any{"name": "test4", "value": nil},
+	}
+
+	if !reflect.DeepEqual(rows, expected) {
+		t.Errorf("rows mismatch:\nwant: %+v\ngot:  %+v", expected, rows)
+	}
+
+	// Write the rows back to a new file using the original schema
+	tmpDir := t.TempDir()
+	outputPath := filepath.Join(tmpDir, "output.parquet")
+
+	// We need to get the schema from the original file to preserve the NULL-type column
+	f, err := os.Open("testdata/null_columns.parquet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := parquet.OpenFile(f, stat.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	schema := file.Schema()
+
+	out, err := os.Create(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+
+	writer := parquet.NewWriter(out, schema)
+	defer writer.Close()
+
+	// Write all rows
+	for _, row := range rows {
+		if err := writer.Write(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read back the written file to verify
+	writtenRows, err := parquet.ReadFile[any](outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(writtenRows, expected) {
+		t.Errorf("written rows mismatch:\nwant: %+v\ngot:  %+v", expected, writtenRows)
+	}
+}
+
 func must[T any](v T, err error) T {
 	if err != nil {
 		panic(err)
@@ -1671,6 +1749,47 @@ func TestIssue40MapValueNestedStruct(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !reflect.DeepEqual(input, output) {
+		t.Errorf("data mismatch:\nwant: %+v\ngot:  %+v", input, output)
+	}
+}
+
+func TestReconstructOptionalListElementsAndMapValues(t *testing.T) {
+	type Data struct {
+		RequiredListElements        []int32             `parquet:"required_elements,list"`
+		OptionalListElements        []*int32            `parquet:"optional_elements,list"`
+		RequiredMapValues           map[string]int32    `parquet:"required_map"`
+		OptionalMapValues           map[string]*int32   `parquet:"optional_map"`
+		MapWithOptionalListElements map[string][]*int32 `parquet:"map_with_optional_list_elements" parquet-value:",list"`
+	}
+
+	int1 := int32(1)
+	input := []Data{
+		{
+			RequiredListElements: []int32{1, 2, 3},
+			OptionalListElements: []*int32{&int1, nil, nil},
+			RequiredMapValues:    map[string]int32{"a": 1, "b": 2, "c": 3},
+			OptionalMapValues:    map[string]*int32{"a": &int1, "b": nil, "c": nil},
+			MapWithOptionalListElements: map[string][]*int32{
+				"a": {&int1, nil, nil},
+				"b": {nil, &int1, nil},
+				"c": {nil, nil, &int1},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := parquet.Write(&buf, input); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	data, size := bytes.NewReader(buf.Bytes()), int64(buf.Len())
+
+	output, err := parquet.Read[Data](data, size)
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+
 	if !reflect.DeepEqual(input, output) {
 		t.Errorf("data mismatch:\nwant: %+v\ngot:  %+v", input, output)
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/parquet-go/bitpack/unsafecast"
 	"github.com/parquet-go/jsonlite"
 	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/format"
 )
 
 var testdataFiles []string
@@ -128,6 +129,15 @@ func TestOpenFileWithoutPageIndex(t *testing.T) {
 	}
 }
 
+// hasLogicalType reports whether lt carries a T annotation, tolerating a nil lt.
+func hasLogicalType[T format.LogicalTypeValue](lt *format.LogicalType) bool {
+	if lt == nil {
+		return false
+	}
+	_, ok := lt.Value.(T)
+	return ok
+}
+
 func printColumns(t *testing.T, col *parquet.Column, indent string) {
 	if t.Failed() {
 		return
@@ -146,11 +156,11 @@ func printColumns(t *testing.T, col *parquet.Column, indent string) {
 	if col.Leaf() {
 		colType := col.Type()
 		if logicalType := colType.LogicalType(); logicalType != nil {
-			if logicalType.Json != nil {
+			if hasLogicalType[*format.JsonType](logicalType) {
 				isJSONColumn = true
 			}
 			// Validate UUID logical type is only applied to FIXED_LEN_BYTE_ARRAY(16)
-			if logicalType.UUID != nil {
+			if hasLogicalType[*format.UUIDType](logicalType) {
 				if colType.Kind() != parquet.FixedLenByteArray {
 					t.Errorf("UUID logical type at path %s must be applied to FIXED_LEN_BYTE_ARRAY, got %v", path, colType.Kind())
 				} else if colType.Length() != 16 {
@@ -366,6 +376,73 @@ func TestOpenFileOptimisticReadWithPrefetchBloomFilters(t *testing.T) {
 		if reads := r.reads.Load(); reads != tt.ExpectedReads {
 			t.Errorf("expected %d read, got %d", tt.ExpectedReads, reads)
 		}
+	}
+}
+
+// Verifies that lazily loading a bloom filter (SkipBloomFilters(true)) issues
+// read calls within the bloom filter's section in the file. Before the fix,
+// readBloomFilter passed a section-relative offset to newBloomFilter as if it
+// were an absolute file offset, so the underlying reads happened near byte 0 of
+// the file instead of inside the bloom filter section, resulting in always
+// returning false negative matches.
+func TestBloomFilterMatchesWhenLoadedOnOpenOrLazyLoad(t *testing.T) {
+	type Row struct {
+		Name string `parquet:"name"`
+	}
+
+	// Write enough rows to push offset past the 1024-byte bufio buffer used by
+	// readBloomFilter.
+	rows := make([]Row, 600)
+	for range 200 {
+		rows = append(rows,
+			Row{Name: "alice"},
+			Row{Name: "bob"},
+			Row{Name: "charlie"},
+		)
+	}
+
+	buf := new(bytes.Buffer)
+	w := parquet.NewGenericWriter[Row](buf,
+		parquet.BloomFilters(parquet.SplitBlockFilter(12, "name")),
+	)
+	if _, err := w.Write(rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	data := buf.Bytes()
+	size := int64(len(data))
+
+	for _, tt := range []struct {
+		skipBloomFilters bool
+	}{
+		{skipBloomFilters: false},
+		{skipBloomFilters: true},
+	} {
+		t.Run(fmt.Sprintf("skipBloomFilters=%t", tt.skipBloomFilters), func(t *testing.T) {
+			pf, err := parquet.OpenFile(bytes.NewReader(data), size,
+				parquet.SkipBloomFilters(tt.skipBloomFilters),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bf := pf.RowGroups()[0].ColumnChunks()[0].BloomFilter()
+			if bf == nil {
+				t.Fatal("expected bloom filter on 'name' column")
+			}
+			if maybeMatch, err := bf.Check(parquet.ValueOf("charlie")); err != nil {
+				t.Fatal(err)
+			} else if !maybeMatch {
+				t.Errorf("bloom filter should have matched 'charlie' but didn't")
+			}
+			if maybeMatch, err := bf.Check(parquet.ValueOf("james")); err != nil {
+				t.Fatal(err)
+			} else if maybeMatch {
+				t.Errorf("bloom filter should not match 'james' but did")
+			}
+		})
 	}
 }
 
@@ -1212,6 +1289,66 @@ func TestRepeatedEmptyGroup(t *testing.T) {
 		}
 		// Note: We cannot verify Empties array length because empty groups
 		// have no columns to store repetition levels
+	}
+}
+
+// TestIssue537NegativeRowGroupNumRows verifies that OpenFile rejects a footer
+// whose row-group num_rows is negative, rather than letting the value reach
+// callers who would panic.
+func TestIssue537NegativeRowGroupNumRows(t *testing.T) {
+	f, err := os.Open("testdata/malformed/negative_row_group_num_rows.parquet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	s, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = parquet.OpenFile(f, s.Size())
+	if err == nil {
+		t.Fatal("OpenFile: expected error for negative row-group num_rows, got nil")
+	}
+	if !strings.Contains(err.Error(), "num_rows") {
+		t.Fatalf("OpenFile: expected num_rows validation error, got %v", err)
+	}
+}
+
+// TestIssue537MalformedPageHeader verifies that files with corrupted page
+// headers return an ErrCorrupted error from ReadPage instead of panicking
+// later in the read path.
+func TestIssue537MalformedPageHeader(t *testing.T) {
+	for _, name := range []string{
+		"negative_page_size",      // compressed_page_size < 0
+		"num_values_exceeds_data", // header num_values larger than the decoded data can hold
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, err := os.Open("testdata/malformed/" + name + ".parquet")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+
+			s, err := f.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			p, err := parquet.OpenFile(f, s.Size())
+			if err != nil {
+				t.Fatalf("OpenFile: footer is intact, expected success, got %v", err)
+			}
+
+			pages := p.RowGroups()[0].ColumnChunks()[0].Pages()
+			defer pages.Close()
+
+			_, err = pages.ReadPage()
+			if !errors.Is(err, parquet.ErrCorrupted) {
+				t.Fatalf("ReadPage: got %v, want error wrapping ErrCorrupted", err)
+			}
+		})
 	}
 }
 

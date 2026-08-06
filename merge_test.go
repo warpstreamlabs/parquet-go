@@ -11,8 +11,10 @@ import (
 	"slices"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/format"
 )
 
 const (
@@ -2612,12 +2614,12 @@ func TestMergeRowGroupsJSONAndByteArrayConversion(t *testing.T) {
 	}
 
 	// Plain schema should NOT have JSON logical type
-	if plainDataField.Node.Type().LogicalType() != nil && plainDataField.Node.Type().LogicalType().Json != nil {
+	if hasLogicalType[*format.JsonType](plainDataField.Node.Type().LogicalType()) {
 		t.Error("Plain schema should not have JSON logical type")
 	}
 
 	// JSON schema SHOULD have JSON logical type
-	if jsonDataField.Node.Type().LogicalType() == nil || jsonDataField.Node.Type().LogicalType().Json == nil {
+	if !hasLogicalType[*format.JsonType](jsonDataField.Node.Type().LogicalType()) {
 		t.Error("JSON schema should have JSON logical type")
 	}
 
@@ -2659,7 +2661,7 @@ func TestMergeRowGroupsJSONAndByteArrayConversion(t *testing.T) {
 		if !ok {
 			t.Fatal("'data' field not found in merged schema")
 		}
-		if mergedDataField.Node.Type().LogicalType() == nil || mergedDataField.Node.Type().LogicalType().Json == nil {
+		if !hasLogicalType[*format.JsonType](mergedDataField.Node.Type().LogicalType()) {
 			t.Error("Expected merged schema to have JSON logical type for 'data' field")
 		}
 
@@ -3344,4 +3346,296 @@ func TestMergeRowGroupsMultipleSequentialOverlappingSegments(t *testing.T) {
 	if !slices.Equal(got, expected) {
 		t.Errorf("got %v, want %v", got, expected)
 	}
+}
+
+// sliceRowReader is a minimal in-memory RowReader used to benchmark the k-way
+// merge algorithm in isolation from parquet page decoding.
+type sliceRowReader struct {
+	rows []parquet.Row
+	off  int
+}
+
+func (r *sliceRowReader) ReadRows(rows []parquet.Row) (n int, err error) {
+	for n < len(rows) && r.off < len(r.rows) {
+		rows[n] = append(rows[n][:0], r.rows[r.off]...)
+		n++
+		r.off++
+	}
+	if n == 0 {
+		return 0, io.EOF
+	}
+	return n, nil
+}
+
+func TestMergeRowReaders(t *testing.T) {
+	compare := func(a, b parquet.Row) int {
+		return parquet.Int64Type.Compare(a[0], b[0])
+	}
+
+	prng := rand.New(rand.NewSource(1))
+
+	for _, numReaders := range []int{2, 3, 4, 5, 7, 8, 16, 31, 64} {
+		t.Run(fmt.Sprintf("readers=%d", numReaders), func(t *testing.T) {
+			for trial := range 10 {
+				expect := make([]int64, 0, numReaders*100)
+				readers := make([]parquet.RowReader, numReaders)
+
+				for i := range readers {
+					n := prng.Intn(100)
+					if trial%3 == 0 && i%2 == 0 {
+						n = 0 // exercise readers that are empty from the start
+					}
+					values := make([]int64, n)
+					for j := range values {
+						values[j] = int64(prng.Intn(50)) // small domain to produce duplicates
+					}
+					slices.Sort(values)
+					rows := make([]parquet.Row, n)
+					for j, v := range values {
+						rows[j] = parquet.Row{parquet.Int64Value(v).Level(0, 0, 0)}
+					}
+					readers[i] = &sliceRowReader{rows: rows}
+					expect = append(expect, values...)
+				}
+				slices.Sort(expect)
+
+				merge := parquet.MergeRowReaders(readers, compare)
+				got := make([]int64, 0, len(expect))
+				rbuf := make([]parquet.Row, 7) // small buffer to exercise buffer boundaries
+				for {
+					n, err := merge.ReadRows(rbuf)
+					for _, row := range rbuf[:n] {
+						got = append(got, row[0].Int64())
+					}
+					if err != nil {
+						if !errors.Is(err, io.EOF) {
+							t.Fatal(err)
+						}
+						break
+					}
+				}
+
+				if !slices.Equal(got, expect) {
+					t.Fatalf("trial %d: merged output mismatch: got %d rows, want %d rows\ngot:  %v\nwant: %v",
+						trial, len(got), len(expect), got, expect)
+				}
+			}
+		})
+	}
+}
+
+// pageReuseRowReader serves BYTE_ARRAY values whose bytes live in an internal
+// page buffer that is overwritten at the start of every ReadRows call, like a
+// parquet reader reusing page buffers. It verifies that consumers such as the
+// k-way merge never hold on to values across a refill of the reader they came
+// from.
+type pageReuseRowReader struct {
+	values []string
+	batch  int
+	page   [4096]byte
+	used   int
+}
+
+func (r *pageReuseRowReader) ReadRows(rows []parquet.Row) (n int, err error) {
+	// Poison the bytes served by the previous call. Any Value still pointing
+	// into this page is now visibly corrupted.
+	for i := range r.page[:r.used] {
+		r.page[i] = '#'
+	}
+	r.used = 0
+	if len(r.values) == 0 {
+		return 0, io.EOF
+	}
+	for n < min(len(rows), r.batch, len(r.values)) {
+		v := r.values[n]
+		off := r.used
+		r.used += copy(r.page[off:], v)
+		rows[n] = append(rows[n][:0], parquet.ByteArrayValue(r.page[off:r.used]).Level(0, 0, 0))
+		n++
+	}
+	r.values = r.values[n:]
+	return n, nil
+}
+
+func TestMergeRowReadersPageReuse(t *testing.T) {
+	compare := func(a, b parquet.Row) int {
+		return parquet.ByteArrayType.Compare(a[0], b[0])
+	}
+
+	for _, numReaders := range []int{2, 3, 4, 7, 16} {
+		t.Run(fmt.Sprintf("readers=%d", numReaders), func(t *testing.T) {
+			const rowsPerReader = 500
+			expect := make([]string, 0, numReaders*rowsPerReader)
+			readers := make([]parquet.RowReader, numReaders)
+
+			for i := range readers {
+				values := make([]string, rowsPerReader)
+				for j := range values {
+					// Zero-padded so byte order matches numeric order,
+					// interleaved across readers.
+					values[j] = fmt.Sprintf("%08d", j*numReaders+i)
+				}
+				// Small batches force refills to interleave with the merge.
+				readers[i] = &pageReuseRowReader{values: values, batch: 5}
+				expect = append(expect, values...)
+			}
+			slices.Sort(expect)
+
+			merge := parquet.MergeRowReaders(readers, compare)
+			got := make([]string, 0, len(expect))
+			rbuf := make([]parquet.Row, 11)
+			for {
+				n, err := merge.ReadRows(rbuf)
+				for _, row := range rbuf[:n] {
+					// Copy the bytes out immediately, as required by the
+					// ReadRows contract: rows are valid until the next call.
+					got = append(got, string(row[0].ByteArray()))
+				}
+				if err != nil {
+					if !errors.Is(err, io.EOF) {
+						t.Fatal(err)
+					}
+					break
+				}
+			}
+
+			if !slices.Equal(got, expect) {
+				for i := range min(len(got), len(expect)) {
+					if got[i] != expect[i] {
+						t.Fatalf("row %d: got %q, want %q", i, got[i], expect[i])
+					}
+				}
+				t.Fatalf("got %d rows, want %d rows", len(got), len(expect))
+			}
+		})
+	}
+}
+
+func BenchmarkMergeRowReaders(b *testing.B) {
+	const rowsPerReader = 10_000
+
+	compare := func(a, b parquet.Row) int {
+		return parquet.Int64Type.Compare(a[0], b[0])
+	}
+
+	for _, numReaders := range []int{2, 3, 4, 8, 16, 32, 64, 128} {
+		b.Run(fmt.Sprintf("readers=%d", numReaders), func(b *testing.B) {
+			// Interleave values across readers so the merge alternates between
+			// inputs on every row, maximizing the number of comparisons.
+			readers := make([]sliceRowReader, numReaders)
+			for i := range readers {
+				rows := make([]parquet.Row, rowsPerReader)
+				for j := range rows {
+					rows[j] = parquet.Row{parquet.Int64Value(int64(j*numReaders+i)).Level(0, 0, 0)}
+				}
+				readers[i].rows = rows
+			}
+
+			rbuf := make([]parquet.Row, benchmarkRowsPerStep)
+			totalRows := int64(0)
+
+			start := time.Now()
+			for b.Loop() {
+				rowReaders := make([]parquet.RowReader, numReaders)
+				for i := range readers {
+					readers[i].off = 0
+					rowReaders[i] = &readers[i]
+				}
+				merge := parquet.MergeRowReaders(rowReaders, compare)
+				for {
+					n, err := merge.ReadRows(rbuf)
+					totalRows += int64(n)
+					if err != nil {
+						if !errors.Is(err, io.EOF) {
+							b.Fatal(err)
+						}
+						break
+					}
+				}
+			}
+			seconds := time.Since(start).Seconds()
+			b.ReportMetric(float64(totalRows)/seconds, "row/s")
+		})
+	}
+}
+
+// TestMergeRowGroupsDescendingSortingColumns is a regression test for
+// https://github.com/parquet-go/parquet-go/issues/564: the non-overlapping
+// segment optimization computed row group bounds in value order, which
+// inverted the first/last rows of row groups sorted in descending order.
+func TestMergeRowGroupsDescendingSortingColumns(t *testing.T) {
+	type Record struct {
+		Value int64 `parquet:"value"`
+	}
+
+	sortingOptions := []parquet.RowGroupOption{
+		parquet.SortingRowGroupConfig(
+			parquet.SortingColumns(
+				parquet.Descending("value"),
+			),
+		),
+	}
+
+	t.Run("overlapping", func(t *testing.T) {
+		// Group1: [40,20,10] overlaps Group2: [20]
+		group1 := fileRowGroup(sortedRowGroup(sortingOptions, Record{40}, Record{20}, Record{10}))
+		group2 := fileRowGroup(sortedRowGroup(sortingOptions, Record{20}))
+
+		merged, err := parquet.MergeRowGroups([]parquet.RowGroup{group1, group2}, sortingOptions...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rows := merged.Rows()
+		defer rows.Close()
+
+		got := readAllInt64Values(t, rows)
+		expected := []int64{40, 20, 20, 10}
+		if !slices.Equal(got, expected) {
+			t.Errorf("got %v, want %v", got, expected)
+		}
+	})
+
+	t.Run("non-overlapping", func(t *testing.T) {
+		// Group1: [20,10] and Group2: [40,30] do not overlap; the merged
+		// output must start with the segment holding the largest values.
+		group1 := fileRowGroup(sortedRowGroup(sortingOptions, Record{20}, Record{10}))
+		group2 := fileRowGroup(sortedRowGroup(sortingOptions, Record{40}, Record{30}))
+
+		merged, err := parquet.MergeRowGroups([]parquet.RowGroup{group1, group2}, sortingOptions...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rows := merged.Rows()
+		defer rows.Close()
+
+		got := readAllInt64Values(t, rows)
+		expected := []int64{40, 30, 20, 10}
+		if !slices.Equal(got, expected) {
+			t.Errorf("got %v, want %v", got, expected)
+		}
+	})
+
+	t.Run("chained overlap", func(t *testing.T) {
+		// Group1: [50,30,10] overlaps Group2: [40,20] which overlaps
+		// Group3: [15,5]; Group1 and Group3 also overlap through Group2.
+		group1 := fileRowGroup(sortedRowGroup(sortingOptions, Record{50}, Record{30}, Record{10}))
+		group2 := fileRowGroup(sortedRowGroup(sortingOptions, Record{40}, Record{20}))
+		group3 := fileRowGroup(sortedRowGroup(sortingOptions, Record{15}, Record{5}))
+
+		merged, err := parquet.MergeRowGroups([]parquet.RowGroup{group1, group2, group3}, sortingOptions...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rows := merged.Rows()
+		defer rows.Close()
+
+		got := readAllInt64Values(t, rows)
+		expected := []int64{50, 40, 30, 20, 15, 10, 5}
+		if !slices.Equal(got, expected) {
+			t.Errorf("got %v, want %v", got, expected)
+		}
+	})
 }

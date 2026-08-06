@@ -24,6 +24,7 @@ import (
 	"github.com/hexops/gotextdiff/span"
 	"github.com/parquet-go/bitpack/unsafecast"
 	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/bloom"
 	"github.com/parquet-go/parquet-go/compress"
 	"github.com/parquet-go/parquet-go/compress/zstd"
 	"github.com/parquet-go/parquet-go/encoding"
@@ -1301,13 +1302,13 @@ message AddressBook {
 }
 
 
-Row group 0:  count: 2  376.50 B records  start: 4  total(compressed): 753 B total(uncompressed):676 B
+Row group 0:  count: 2  387.00 B records  start: 4  total(compressed): 774 B total(uncompressed):697 B
 --------------------------------------------------------------------------------
                       type      encodings count     avg size   nulls   min / max
 owner                 BINARY    Z         2         71.00 B    0       "A. Nonymous" / "Julien Le Dem"
 ownerPhoneNumbers     BINARY    G         3         81.00 B    1       "555 123 4567" / "555 666 1337"
 contacts.name         BINARY    _         3         70.67 B    1       "Chris Aniszczyk" / "Dmitriy Ryaboy"
-contacts.phoneNumber  BINARY    Z         3         52.00 B    1       "" / "555 987 6543"
+contacts.phoneNumber  BINARY    Z         3         59.00 B    2       "555 987 6543" / "555 987 6543"
 
 
 Column: owner
@@ -1333,7 +1334,7 @@ Column: contacts.name
 Column: contacts.phoneNumber
 --------------------------------------------------------------------------------
   page   type  enc  count   avg size   size       rows     nulls   min / max
-  0-0    data  Z D  2       18.00 B    36 B                0       "" / "555 987 6543"
+  0-0    data  Z D  2       16.50 B    33 B                1       "555 987 6543" / "555 987 6543"
   0-1    data  Z D  1       17.00 B    17 B                1
 
 `,
@@ -1380,13 +1381,13 @@ message AddressBook {
 }
 
 
-Row group 0:  count: 2  370.00 B records  start: 4  total(compressed): 740 B total(uncompressed):663 B
+Row group 0:  count: 2  380.50 B records  start: 4  total(compressed): 761 B total(uncompressed):684 B
 --------------------------------------------------------------------------------
                       type      encodings count     avg size   nulls   min / max
 owner                 BINARY    Z         2         73.50 B    0       "A. Nonymous" / "Julien Le Dem"
 ownerPhoneNumbers     BINARY    G         3         78.67 B    1       "555 123 4567" / "555 666 1337"
 contacts.name         BINARY    _         3         68.67 B    1       "Chris Aniszczyk" / "Dmitriy Ryaboy"
-contacts.phoneNumber  BINARY    Z         3         50.33 B    1       "" / "555 987 6543"
+contacts.phoneNumber  BINARY    Z         3         57.33 B    2       "555 987 6543" / "555 987 6543"
 
 
 Column: owner
@@ -1412,7 +1413,7 @@ Column: contacts.name
 Column: contacts.phoneNumber
 --------------------------------------------------------------------------------
   page   type  enc  count   avg size   size       rows     nulls   min / max
-  0-0    data  _ D  2       14.00 B    28 B       1        0       "" / "555 987 6543"
+  0-0    data  _ D  2       12.50 B    25 B       1        1       "555 987 6543" / "555 987 6543"
   0-1    data  _ D  1       9.00 B     9 B        1        1
 
 `,
@@ -1957,6 +1958,63 @@ func TestWriterMaxRowsPerRowGroup(t *testing.T) {
 	rowGroups := f.RowGroups()
 	if len(rowGroups) != 10 {
 		t.Errorf("wrong number of row groups in parquet file: want=10 got=%d", len(rowGroups))
+	}
+}
+
+func TestWriterEncodingStatsDoNotAliasRowGroups(t *testing.T) {
+	type Row struct {
+		Value string `parquet:"value,plain"`
+	}
+
+	output := new(bytes.Buffer)
+	writer := parquet.NewGenericWriter[Row](output, parquet.PageBufferSize(64))
+
+	writeRow := func(value string) {
+		t.Helper()
+		if _, err := writer.Write([]Row{{Value: value}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i := range 3 {
+		writeRow(strings.Repeat(string(rune('a'+i)), 128))
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	writeRow(strings.Repeat("z", 128))
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := parquet.OpenFile(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.RowGroups()) != 2 {
+		t.Fatalf("wrong number of row groups: got %d, want 2", len(f.RowGroups()))
+	}
+
+	wantPages := []int{3, 1}
+	for i, rowGroup := range f.RowGroups() {
+		offsetIndex, err := rowGroup.ColumnChunks()[0].OffsetIndex()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if numPages := offsetIndex.NumPages(); numPages != wantPages[i] {
+			t.Fatalf("row group %d has %d pages, want %d", i, numPages, wantPages[i])
+		}
+
+		var dataPageCount int32
+		for _, stats := range f.Metadata().RowGroups[i].Columns[0].MetaData.EncodingStats {
+			if stats.PageType == format.DataPage || stats.PageType == format.DataPageV2 {
+				dataPageCount += stats.Count
+			}
+		}
+		if dataPageCount != int32(wantPages[i]) {
+			t.Errorf("row group %d encoding stats report %d data pages, want %d", i, dataPageCount, wantPages[i])
+		}
 	}
 }
 
@@ -3451,7 +3509,7 @@ func TestIssue449DecimalReadWrite(t *testing.T) {
 				}
 				// Compare at decimal precision since binary floats can't exactly represent
 				// decimal fractions like 0.12
-				scale := int(tt.typ.Type().LogicalType().Decimal.Scale)
+				scale := int(tt.typ.Type().LogicalType().Value.(*format.DecimalType).Scale)
 				expText := expFloat.Text('f', scale)
 				actualText := actualFloat.Text('f', scale)
 				if expText != actualText {
@@ -3461,6 +3519,279 @@ func TestIssue449DecimalReadWrite(t *testing.T) {
 				t.Fatalf("expected %v, got %v", exp, row["a"])
 			}
 		})
+	}
+}
+
+// TestIssue508ByteSliceDecimalReadWrite reproduces issue #508: when a Go
+// struct field is declared as []byte with a decimal(...) tag that resolves to
+// FIXED_LEN_BYTE_ARRAY, the optimized GenericWriter path used to copy the
+// slice header bytes instead of the slice contents. This test round-trips
+// multiple rows with distinct values through GenericWriter and asserts both
+// the required and optional columns contain the exact input bytes. Multiple
+// rows are important: a single-row test would miss off-by-one errors in the
+// byte-buffer indexing of the fix.
+func TestIssue508ByteSliceDecimalReadWrite(t *testing.T) {
+	type Row struct {
+		Bet []byte `parquet:"bet_amount,decimal(8:29)"`
+		Opt []byte `parquet:"total_bet_amount,optional,decimal(8:29)"`
+	}
+
+	// Encode `value` big-endian into a fresh 13-byte fixed-length buffer.
+	encode := func(value uint32) []byte {
+		b := make([]byte, 13)
+		b[9] = byte(value >> 24)
+		b[10] = byte(value >> 16)
+		b[11] = byte(value >> 8)
+		b[12] = byte(value)
+		return b
+	}
+
+	rows := []Row{
+		{Bet: encode(200000000), Opt: encode(200000000)},
+		{Bet: encode(1), Opt: encode(2)},
+		{Bet: encode(0xdeadbeef), Opt: encode(0xcafef00d)},
+	}
+
+	var buf bytes.Buffer
+	w := parquet.NewGenericWriter[Row](&buf)
+	if _, err := w.Write(rows); err != nil {
+		t.Fatalf("unable to write: %s", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("unable to close writer: %s", err)
+	}
+
+	f, err := parquet.OpenFile(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("unable to open file: %s", err)
+	}
+
+	for _, col := range []string{"bet_amount", "total_bet_amount"} {
+		leaf, ok := f.Schema().Lookup(col)
+		if !ok {
+			t.Fatalf("column %q not found in schema", col)
+		}
+		if got, want := leaf.Node.Type().Kind(), parquet.FixedLenByteArray; got != want {
+			t.Fatalf("column %q: expected physical type %v, got %v", col, want, got)
+		}
+		if got, want := leaf.Node.Type().Length(), 13; got != want {
+			t.Fatalf("column %q: expected length %d, got %d", col, want, got)
+		}
+	}
+
+	// Use the raw row reader so we can assert on the exact bytes stored in
+	// the parquet file, bypassing the decimal->*big.Float reconstruct path
+	// which does not support []byte destinations.
+	reader := f.RowGroups()[0].Rows()
+	defer reader.Close()
+
+	rowBuf := make([]parquet.Row, len(rows))
+	n, err := reader.ReadRows(rowBuf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("unable to read rows: %s", err)
+	}
+	if n != len(rows) {
+		t.Fatalf("expected %d rows, got %d", len(rows), n)
+	}
+
+	for i, got := range rowBuf {
+		if len(got) != 2 {
+			t.Fatalf("row %d: expected 2 column values, got %d", i, len(got))
+		}
+		if !bytes.Equal(got[0].ByteArray(), rows[i].Bet) {
+			t.Errorf("row %d bet_amount: got %x, want %x", i, got[0].ByteArray(), rows[i].Bet)
+		}
+		if !bytes.Equal(got[1].ByteArray(), rows[i].Opt) {
+			t.Errorf("row %d total_bet_amount: got %x, want %x", i, got[1].ByteArray(), rows[i].Opt)
+		}
+	}
+}
+
+// TestIssue508ByteSliceDecimalWrongLength asserts that writing a []byte value
+// whose length does not match the FIXED_LEN_BYTE_ARRAY size fails with a
+// clear error instead of silently truncating or corrupting the output. Before
+// the fix, wrong-length input was copied as slice-header bytes and produced
+// plausible-looking but incorrect column data.
+func TestIssue508ByteSliceDecimalWrongLength(t *testing.T) {
+	type Row struct {
+		Bet []byte `parquet:"bet_amount,decimal(8:29)"`
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on wrong-length []byte value, got none")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			if e, isErr := r.(error); isErr {
+				msg = e.Error()
+			}
+		}
+		if !strings.Contains(msg, "FIXED_LEN_BYTE_ARRAY(13)") {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+	}()
+
+	var buf bytes.Buffer
+	w := parquet.NewGenericWriter[Row](&buf)
+	// 5 bytes instead of the required 13 — must fail loudly.
+	_, _ = w.Write([]Row{{Bet: []byte{1, 2, 3, 4, 5}}})
+	_ = w.Close()
+}
+
+// TestIssue508OptionalNilByteSliceWritesNull covers the second issue surfaced
+// in the #508 thread: an optional []byte field that resolves to
+// FIXED_LEN_BYTE_ARRAY used to panic with "cannot write byte slice of length
+// 0" when the slice was nil. A nil value on an optional field should write
+// NULL instead.
+func TestIssue508OptionalNilByteSliceWritesNull(t *testing.T) {
+	type Row struct {
+		Opt []byte `parquet:"value,optional,decimal(8:29)"`
+	}
+
+	encode := func(value uint32) []byte {
+		b := make([]byte, 13)
+		b[9] = byte(value >> 24)
+		b[10] = byte(value >> 16)
+		b[11] = byte(value >> 8)
+		b[12] = byte(value)
+		return b
+	}
+
+	rows := []Row{
+		{Opt: encode(1)},
+		{Opt: nil},
+		{Opt: encode(2)},
+		{Opt: nil},
+	}
+
+	var buf bytes.Buffer
+	w := parquet.NewGenericWriter[Row](&buf)
+	if _, err := w.Write(rows); err != nil {
+		t.Fatalf("unable to write: %s", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("unable to close writer: %s", err)
+	}
+
+	f, err := parquet.OpenFile(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("unable to open file: %s", err)
+	}
+
+	reader := f.RowGroups()[0].Rows()
+	defer reader.Close()
+
+	rowBuf := make([]parquet.Row, len(rows))
+	n, err := reader.ReadRows(rowBuf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("unable to read rows: %s", err)
+	}
+	if n != len(rows) {
+		t.Fatalf("expected %d rows, got %d", len(rows), n)
+	}
+
+	for i, got := range rowBuf {
+		if len(got) != 1 {
+			t.Fatalf("row %d: expected 1 column value, got %d", i, len(got))
+		}
+		if rows[i].Opt == nil {
+			if !got[0].IsNull() {
+				t.Errorf("row %d: expected null, got bytes %x", i, got[0].ByteArray())
+			}
+		} else {
+			if got[0].IsNull() {
+				t.Errorf("row %d: expected non-null, got null", i)
+			}
+			if !bytes.Equal(got[0].ByteArray(), rows[i].Opt) {
+				t.Errorf("row %d: got %x, want %x", i, got[0].ByteArray(), rows[i].Opt)
+			}
+		}
+	}
+}
+
+// TestIssue508PointerArrayDecimalSupported covers the third issue from the
+// #508 thread: *[N]byte with a decimal(...) tag used to panic during schema
+// derivation because the decimal tag handler did not unwrap reflect.Ptr. A
+// pointer to a fixed-length byte array is the natural way to express a
+// nullable fixed-length decimal column.
+func TestIssue508PointerArrayDecimalSupported(t *testing.T) {
+	type Row struct {
+		Value *[13]byte `parquet:"value,decimal(8:29)"`
+	}
+
+	encode := func(value uint32) *[13]byte {
+		var b [13]byte
+		b[9] = byte(value >> 24)
+		b[10] = byte(value >> 16)
+		b[11] = byte(value >> 8)
+		b[12] = byte(value)
+		return &b
+	}
+
+	rows := []Row{
+		{Value: encode(1)},
+		{Value: nil},
+		{Value: encode(0xdeadbeef)},
+	}
+
+	var buf bytes.Buffer
+	w := parquet.NewGenericWriter[Row](&buf)
+	if _, err := w.Write(rows); err != nil {
+		t.Fatalf("unable to write: %s", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("unable to close writer: %s", err)
+	}
+
+	f, err := parquet.OpenFile(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("unable to open file: %s", err)
+	}
+
+	leaf, ok := f.Schema().Lookup("value")
+	if !ok {
+		t.Fatal("column \"value\" not found in schema")
+	}
+	if got, want := leaf.Node.Type().Kind(), parquet.FixedLenByteArray; got != want {
+		t.Fatalf("expected physical type %v, got %v", want, got)
+	}
+	if got, want := leaf.Node.Type().Length(), 13; got != want {
+		t.Fatalf("expected length %d, got %d", want, got)
+	}
+	if !leaf.Node.Optional() {
+		t.Fatal("expected pointer field to derive an optional schema node")
+	}
+
+	reader := f.RowGroups()[0].Rows()
+	defer reader.Close()
+
+	rowBuf := make([]parquet.Row, len(rows))
+	n, err := reader.ReadRows(rowBuf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("unable to read rows: %s", err)
+	}
+	if n != len(rows) {
+		t.Fatalf("expected %d rows, got %d", len(rows), n)
+	}
+
+	for i, got := range rowBuf {
+		if len(got) != 1 {
+			t.Fatalf("row %d: expected 1 column value, got %d", i, len(got))
+		}
+		if rows[i].Value == nil {
+			if !got[0].IsNull() {
+				t.Errorf("row %d: expected null, got bytes %x", i, got[0].ByteArray())
+			}
+		} else {
+			if got[0].IsNull() {
+				t.Errorf("row %d: expected non-null, got null", i)
+			}
+			if !bytes.Equal(got[0].ByteArray(), rows[i].Value[:]) {
+				t.Errorf("row %d: got %x, want %x", i, got[0].ByteArray(), rows[i].Value[:])
+			}
+		}
 	}
 }
 
@@ -4141,6 +4472,154 @@ func TestIssue472DataPageV2DictCompression(t *testing.T) {
 	for i, r := range readBack {
 		if r != records[i] {
 			t.Errorf("row %d: got %v, want %v", i, r, records[i])
+		}
+	}
+}
+
+func TestWriteOptionalListWithGenericWriterReflectionPath(t *testing.T) {
+	type Row struct {
+		OptionalList []*string `parquet:"optional_list,list"`
+	}
+
+	var (
+		numRows      = 50
+		expectedRows = make([]Row, 0, numRows)
+		inputs       = make([]any, 0, numRows)
+	)
+
+	for i := range numRows {
+		var row Row
+		if i%2 == 0 {
+			row = Row{OptionalList: []*string{nil}}
+		} else {
+			value := fmt.Sprintf("value_%d", i)
+			row = Row{OptionalList: []*string{&value}}
+		}
+		expectedRows = append(expectedRows, row)
+		inputs = append(inputs, row)
+	}
+
+	var buf bytes.Buffer
+	writer := parquet.NewGenericWriter[any](&buf, parquet.SchemaOf(Row{}))
+	if _, err := writer.Write(inputs); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close writer: %v", err)
+	}
+	data, size := bytes.NewReader(buf.Bytes()), int64(buf.Len())
+
+	output, err := parquet.Read[Row](data, size)
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+
+	if !reflect.DeepEqual(expectedRows, output) {
+		t.Errorf("data mismatch:\nwant: %+v\ngot:  %+v", expectedRows, output)
+	}
+}
+
+// TestWriterPlainDictionaryEncoding verifies that a column configured with
+// the deprecated PLAIN_DICTIONARY encoding (typical of schemas derived from
+// files written by legacy parquet-java writers) produces data pages readers
+// understand. plain.DictionaryEncoding lays dictionary indices out as plain
+// int32s, but readers — including this package's own — decode both
+// dictionary encodings with the RLE_DICTIONARY data page layout (bit-width
+// prefix + RLE/bit-packed runs), so pages written with the plain layout
+// silently decoded every row as dictionary entry 0. The writer normalizes
+// PLAIN_DICTIONARY to RLE_DICTIONARY instead.
+func TestWriterPlainDictionaryEncoding(t *testing.T) {
+	type row struct{ Name string }
+	schema := parquet.NewSchema("root", parquet.Group{
+		"Name": parquet.Encoded(parquet.String(), &parquet.PlainDictionary),
+	})
+
+	rows := []row{{"alpha"}, {"beta"}, {"gamma"}}
+	buffer := new(bytes.Buffer)
+	w := parquet.NewGenericWriter[row](buffer, schema)
+	if _, err := w.Write(rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := parquet.Read[row](bytes.NewReader(buffer.Bytes()), int64(buffer.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, rows) {
+		t.Errorf("rows read back = %v, want %v", got, rows)
+	}
+
+	// The chunk metadata must advertise RLE_DICTIONARY so the pages are
+	// readable by other implementations; a reader-side workaround for the
+	// plain int32 layout would pass the round-trip above but break interop.
+	pf, err := parquet.OpenFile(bytes.NewReader(buffer.Bytes()), int64(buffer.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodings := pf.Metadata().RowGroups[0].Columns[0].MetaData.Encoding
+	if slices.Contains(encodings, format.PlainDictionary) || !slices.Contains(encodings, format.RLEDictionary) {
+		t.Errorf("column chunk encodings = %v, want RLE_DICTIONARY and no PLAIN_DICTIONARY", encodings)
+	}
+}
+
+// TestWriterCorrectlySizesBloomFilterOnRowLimit verifies that when a single
+// input row group is split into multiple output row groups (because it exceeds
+// MaxRowsPerRowGroup), each output group's bloom filter is sized to the values
+// that actually land in that group rather than to the whole input. Without the
+// fix, filters were sized from the full-input value count and over-allocated on
+// every split group.
+func TestWriterCorrectlySizesBloomFilterOnRowLimit(t *testing.T) {
+	type Row struct {
+		ID int64 `parquet:"id"`
+	}
+
+	// Make sure the row group size is greater than max rows. This avoids the fast
+	// paths on purpose, and the splitting of groups would trigger the resize bug
+	// without the fix.
+	const (
+		writtenRows        = 60
+		maxRowsPerRowGroup = 50
+	)
+
+	inputGroup := parquet.NewGenericBuffer[Row]()
+	_, err := inputGroup.Write(make([]Row, writtenRows))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := parquet.NewGenericWriter[Row](&buf,
+		parquet.BloomFilters(parquet.SplitBlockFilter(10, "id")),
+		parquet.MaxRowsPerRowGroup(maxRowsPerRowGroup),
+	)
+	if _, err := w.WriteRowGroup(inputGroup); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pf, err := parquet.OpenFile(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rg := range pf.Metadata().RowGroups {
+		meta := rg.Columns[0].MetaData
+		section := io.NewSectionReader(pf, meta.BloomFilterOffset, int64(meta.BloomFilterLength))
+		compact := thrift.CompactProtocol{}
+
+		var header format.BloomFilterHeader
+		if err := thrift.NewDecoder(compact.NewReader(section)).Decode(&header); err != nil {
+			t.Fatal(err)
+		}
+
+		expectBloomSize := bloom.BlockSize * bloom.NumSplitBlocksOf(rg.NumRows, 10)
+		gotBloomSize := int(header.NumBytes)
+		if gotBloomSize != expectBloomSize {
+			t.Errorf("got %v, want %v", gotBloomSize, expectBloomSize)
 		}
 	}
 }

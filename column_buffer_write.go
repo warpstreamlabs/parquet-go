@@ -12,6 +12,7 @@ import (
 
 	"github.com/parquet-go/jsonlite"
 	"github.com/parquet-go/parquet-go/deprecated"
+	"github.com/parquet-go/parquet-go/format"
 	"github.com/parquet-go/parquet-go/internal/memory"
 	"github.com/parquet-go/parquet-go/sparse"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -34,7 +35,7 @@ type writeRowsFunc func(columns []ColumnBuffer, levels columnLevels, rows sparse
 func writeRowsFuncOf(t reflect.Type, schema *Schema, path columnPath, tagReplacements []StructTagOption) writeRowsFunc {
 	if leaf, exists := schema.Lookup(path...); exists {
 		logicalType := leaf.Node.Type().LogicalType()
-		if logicalType != nil && logicalType.Json != nil {
+		if logicalTypeIs[*format.JsonType](logicalType) {
 			return writeRowsFuncOfJSON(t, schema, path)
 		}
 	}
@@ -68,6 +69,15 @@ func writeRowsFuncOf(t reflect.Type, schema *Schema, path columnPath, tagReplace
 		return writeRowsFuncOfSmallInt(t, schema, path)
 	case reflect.Slice:
 		if t.Elem().Kind() == reflect.Uint8 {
+			// When the column physical type is FIXED_LEN_BYTE_ARRAY (e.g. the
+			// field carries a decimal(...) tag), the optimized direct-memory
+			// path would read the slice header bytes instead of the slice
+			// contents. Dispatch to a dedicated writer that indirects through
+			// the slice header. See issue #508.
+			column := schema.lazyLoadState().mapping.lookup(path)
+			if column.node.Type().Kind() == FixedLenByteArray {
+				return writeRowsFuncOfByteSlice(t, schema, path)
+			}
 			return writeRowsFuncOfRequired(t, schema, path)
 		} else {
 			return writeRowsFuncOfSlice(t, schema, path, tagReplacements)
@@ -290,12 +300,6 @@ func writeRowsFuncOfOptional(t reflect.Type, schema *Schema, path columnPath, wr
 				}
 			}
 		}
-		// []byte: fall through to nullIndex (nil = null, non-nil = value)
-	case reflect.Pointer, reflect.Map:
-		// Fall through to nullIndex (nil = null, non-nil = value)
-	default:
-		// Value types (bool, int, float, string, struct, etc.) are never null
-		return writeOptional
 	}
 
 	nullIndex := nullIndexFuncOf(t)
@@ -400,6 +404,61 @@ func writeRowsFuncOfArray(t reflect.Type, schema *Schema, path columnPath) write
 		panic(fmt.Sprintf("cannot convert Go values of type "+typeNameOf(t)+" to FIXED_LEN_BYTE_ARRAY(%d)", columnLen))
 	}
 	return writeRowsFuncOfRequired(t, schema, path)
+}
+
+type byteSliceBuf struct{ values []byte }
+
+var byteSliceBufPool memory.Pool[byteSliceBuf]
+
+// writeRowsFuncOfByteSlice handles writing []byte Go fields into a
+// FIXED_LEN_BYTE_ARRAY column. The optimized path used for other []byte
+// columns treats each sparse.Array element as raw bytes, but for a slice
+// field that element is a slice header. This function reads each slice via
+// rows.StringArray() (string and []byte share the ptr/len header layout),
+// copies the referenced bytes into a contiguous scratch buffer, and forwards
+// the buffer as a flat sparse.Array so the column buffer's existing write
+// path sees real fixed-size elements.
+func writeRowsFuncOfByteSlice(t reflect.Type, schema *Schema, path columnPath) writeRowsFunc {
+	column := schema.lazyLoadState().mapping.lookup(path)
+	columnIndex := column.columnIndex
+	if columnIndex == math.MaxUint16 {
+		panic("parquet: column not found: " + path.String())
+	}
+	size := column.node.Type().Length()
+	return func(columns []ColumnBuffer, levels columnLevels, rows sparse.Array) {
+		n := rows.Len()
+		if n == 0 {
+			columns[columnIndex].writeValues(levels, rows)
+			return
+		}
+
+		buf := byteSliceBufPool.Get(
+			func() *byteSliceBuf { return new(byteSliceBuf) },
+			func(b *byteSliceBuf) { b.values = b.values[:0] },
+		)
+		buf.values = slices.Grow(buf.values, n*size)[:n*size]
+		// Zero-fill so empty/nil slice slots emit placeholder bytes; the
+		// pooled buffer may otherwise carry stale contents from a previous
+		// caller. The optional wrapper upstream marks those rows null via
+		// the definition level, matching fixedLenByteArrayColumnBuffer.writeNull.
+		clear(buf.values)
+		defer byteSliceBufPool.Put(buf)
+
+		stringArray := rows.StringArray()
+		for i := range n {
+			s := stringArray.Index(i)
+			switch len(s) {
+			case 0:
+			case size:
+				copy(buf.values[i*size:], s)
+			default:
+				panic(fmt.Sprintf("cannot write byte slice of length %d to FIXED_LEN_BYTE_ARRAY(%d) column", len(s), size))
+			}
+		}
+
+		flatArray := sparse.UnsafeArray(unsafe.Pointer(&buf.values[0]), n, uintptr(size))
+		columns[columnIndex].writeValues(levels, flatArray)
+	}
 }
 
 func writeRowsFuncOfPointer(t reflect.Type, schema *Schema, path columnPath, tagReplacements []StructTagOption) writeRowsFunc {
@@ -554,6 +613,11 @@ func writeRowsFuncOfStruct(t reflect.Type, schema *Schema, path columnPath, tagR
 			case f.Type == reflect.TypeFor[json.RawMessage]():
 				// json.RawMessage handles its own definition levels through
 				// writeRowsFuncOfJSONRawMessage -> writeValueFuncOf -> writeValueFuncOfOptional
+			case f.Type == reflect.TypeFor[time.Time]():
+				// time.Time is a struct but has IsZero() method,
+				// so it needs special handling.
+				// Don't use writeRowsFuncOfOptional which relies
+				// on bitmap batching.
 			default:
 				writeRows = writeRowsFuncOfOptional(f.Type, schema, columnPath, writeRows)
 			}
@@ -855,38 +919,80 @@ func writeRowsFuncOfJSON(t reflect.Type, schema *Schema, path columnPath) writeR
 
 func writeRowsFuncOfTime(_ reflect.Type, schema *Schema, path columnPath, tagReplacements []StructTagOption) writeRowsFunc {
 	t := reflect.TypeFor[int64]()
-	elemSize := uintptr(t.Size())
 	writeRows := writeRowsFuncOf(t, schema, path, tagReplacements)
 
 	col, _ := schema.Lookup(path...)
 	unit := Nanosecond.TimeUnit()
 	lt := col.Node.Type().LogicalType()
-	if lt != nil && lt.Timestamp != nil {
-		unit = lt.Timestamp.Unit
+	if ts, ok := logicalTypeOf[*format.TimestampType](lt); ok {
+		unit = ts.Unit
 	}
 
+	// Check if the column is optional
+	isOptional := col.Node.Optional()
+
 	return func(columns []ColumnBuffer, levels columnLevels, rows sparse.Array) {
-		if rows.Len() == 0 {
+		n := rows.Len()
+		if n == 0 {
 			writeRows(columns, levels, rows)
 			return
 		}
 
-		times := rows.TimeArray()
-		for i := range times.Len() {
-			t := times.Index(i)
+		// If we're optional and the current definition level is already > 0,
+		// then we're in a pointer/nested context where writeRowsFuncOfPointer
+		// already handles optionality.
+		//
+		// Don't double-handle it here. For simple optional fields,
+		// definitionLevel starts at 0.
+		alreadyHandled := isOptional && levels.definitionLevel > 0
 
-			var val int64
-			switch {
-			case unit.Millis != nil:
-				val = t.UnixMilli()
-			case unit.Micros != nil:
-				val = t.UnixMicro()
-			default:
-				val = t.UnixNano()
+		buf := wideIntBufPool.Get(
+			func() *wideIntBuf { return new(wideIntBuf) },
+			func(b *wideIntBuf) { b.values = b.values[:0] },
+		)
+		buf.values = slices.Grow(buf.values, n)[:n]
+		defer wideIntBufPool.Put(buf)
+
+		times := rows.TimeArray()
+		switch unit.Value.(type) {
+		case *format.MilliSeconds:
+			for i := range n {
+				buf.values[i] = times.Index(i).UnixMilli()
+			}
+		case *format.MicroSeconds:
+			for i := range n {
+				buf.values[i] = times.Index(i).UnixMicro()
+			}
+		default:
+			for i := range n {
+				buf.values[i] = times.Index(i).UnixNano()
+			}
+		}
+
+		if !isOptional || alreadyHandled {
+			writeRows(columns, levels, sparse.MakeInt64Array(buf.values).UnsafeArray())
+			return
+		}
+
+		i := 0
+		empty := sparse.Array{}
+		for i < n {
+			j := i
+			isNull := times.Index(i).IsZero()
+			for j < n && times.Index(j).IsZero() == isNull {
+				j++
 			}
 
-			a := makeArray(reflectValueData(reflect.ValueOf(val)), 1, elemSize)
-			writeRows(columns, levels, a)
+			if isNull {
+				for k := i; k < j; k++ {
+					writeRows(columns, levels, empty)
+				}
+			} else {
+				elemLevels := levels
+				elemLevels.definitionLevel++
+				writeRows(columns, elemLevels, sparse.MakeInt64Array(buf.values[i:j]).UnsafeArray())
+			}
+			i = j
 		}
 	}
 }

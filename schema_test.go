@@ -352,6 +352,38 @@ func TestSchemaOf(t *testing.T) {
 	}
 }`,
 		},
+		// Test that nested slices under a `list` tag become LIST at every
+		// level implicitly, with no explicit parquet-element tag needed.
+		{
+			value: new(struct {
+				Matrix [][]int32   `parquet:"matrix,list"`
+				Cube   [][][]int64 `parquet:"cube,list"`
+			}),
+			print: `message {
+	required group matrix (LIST) {
+		repeated group list {
+			required group element (LIST) {
+				repeated group list {
+					required int32 element (INT(32,true));
+				}
+			}
+		}
+	}
+	required group cube (LIST) {
+		repeated group list {
+			required group element (LIST) {
+				repeated group list {
+					required group element (LIST) {
+						repeated group list {
+							required int64 element (INT(64,true));
+						}
+					}
+				}
+			}
+		}
+	}
+}`,
+		},
 		{
 			value: new(struct {
 				A [16]byte `parquet:",uuid"`
@@ -382,6 +414,16 @@ func TestSchemaOf(t *testing.T) {
 			}),
 			print: `message {
 	required binary parquet_user_id (STRING);
+}`,
+		},
+
+		// Test that explicit parquet tag name takes precedence over protobuf tag name when go field name matches parquet name
+		{
+			value: new(struct {
+				MyKey int64 `protobuf:"varint,1,opt,name=my_key,proto3" parquet:"MyKey"` // Index into string table
+			}),
+			print: `message {
+	required int64 MyKey (INT(64,true));
 }`,
 		},
 
@@ -507,6 +549,16 @@ func TestSchemaOf(t *testing.T) {
 	optional int64 timestamp (TIMESTAMP(isAdjustedToUTC=true,unit=MILLIS));
 }`,
 		},
+
+		// Whitespace after commas in option lists is tolerated.
+		{
+			value: new(struct {
+				Name string `parquet:"name, optional"`
+			}),
+			print: `message {
+	optional binary name (STRING);
+}`,
+		},
 	}
 
 	for _, test := range tests {
@@ -517,6 +569,53 @@ func TestSchemaOf(t *testing.T) {
 				t.Errorf("\nexpected:\n\n%s\n\nfound:\n\n%s\n", test.print, s)
 			}
 		})
+	}
+}
+
+// Nested slices tagged `list` round-trip exactly at every depth, including
+// the empty-inner shapes that distinguish LIST from bare repetition.
+func TestNestedSliceListRoundTrip(t *testing.T) {
+	type Row struct {
+		Matrix [][]int32   `parquet:"matrix,list"`
+		Cube   [][][]int64 `parquet:"cube,list"`
+	}
+	rows := []Row{
+		{
+			Matrix: [][]int32{{1, 2}, {}, {3}},
+			Cube:   [][][]int64{{{1}, {2, 3}}, {{4, 5, 6}}},
+		},
+		{
+			Matrix: [][]int32{},
+			Cube:   [][][]int64{{}},
+		},
+		{
+			Matrix: [][]int32{{}},
+			Cube:   [][][]int64{{{}}},
+		},
+	}
+
+	buf := new(bytes.Buffer)
+	w := parquet.NewGenericWriter[Row](buf)
+	if _, err := w.Write(rows); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	r := parquet.NewGenericReader[Row](bytes.NewReader(buf.Bytes()))
+	got := make([]Row, len(rows))
+	n, err := r.Read(got)
+	if err != nil && err != io.EOF {
+		t.Fatalf("read: %v", err)
+	}
+	if n != len(rows) {
+		t.Fatalf("read %d rows, want %d", n, len(rows))
+	}
+	for i := range rows {
+		if !reflect.DeepEqual(rows[i], got[i]) {
+			t.Errorf("row %d mismatch:\nwant %+v\ngot  %+v", i, rows[i], got[i])
+		}
 	}
 }
 
@@ -656,6 +755,34 @@ func TestInvalidSchemaOf(t *testing.T) {
 				V int `parquet:",int"`
 			}),
 			panic: `int() is an invalid parquet tag: V int [int()]`,
+		},
+		// Unrecognized options on regular struct fields must panic via
+		// throwUnknownTag, mirroring the existing strict behavior for map
+		// option tags. xitongsys/parquet-go-style tags (type=, convertedtype=,
+		// repetitiontype=) are the most common offenders.
+		{
+			value: new(struct {
+				Date time.Time `parquet:"date, type=INT64, convertedtype=TIMESTAMP_MILLIS"`
+			}),
+			panic: `type=INT64 is an unrecognized parquet tag: date time.Time [type=INT64]`,
+		},
+		{
+			value: new(struct {
+				Date time.Time `parquet:"date,convertedtype=TIMESTAMP_MILLIS"`
+			}),
+			panic: `convertedtype=TIMESTAMP_MILLIS is an unrecognized parquet tag: date time.Time [convertedtype=TIMESTAMP_MILLIS]`,
+		},
+		{
+			value: new(struct {
+				V int `parquet:",foobar"`
+			}),
+			panic: `foobar is an unrecognized parquet tag: V int [foobar]`,
+		},
+		{
+			value: new(struct {
+				V int `parquet:",foo(bar)"`
+			}),
+			panic: `foo(bar) is an unrecognized parquet tag: V int [foo(bar)]`,
 		},
 	}
 
@@ -956,121 +1083,121 @@ func TestSchemaRoundTrip(t *testing.T) {
 		required group shredded {
 			optional group bool (VARIANT) {
 				required binary metadata;
-				optional boolean typed_value;
 				optional binary value;
+				optional boolean typed_value;
 			}
 			optional group date (VARIANT) {
 				required binary metadata;
-				optional int32 typed_value (DATE);
 				optional binary value;
+				optional int32 typed_value (DATE);
 			}
 			optional group decimal (VARIANT) {
 				required binary metadata;
-				optional int32 typed_value (DECIMAL(9,5));
 				optional binary value;
+				optional int32 typed_value (DECIMAL(9,5));
 			}
 			optional group double (VARIANT) {
 				required binary metadata;
-				optional double typed_value;
 				optional binary value;
+				optional double typed_value;
 			}
 			optional group float (VARIANT) {
 				required binary metadata;
-				optional float typed_value;
 				optional binary value;
+				optional float typed_value;
 			}
 			optional group group (VARIANT) {
 				required binary metadata;
+				optional binary value;
 				optional group typed_value {
 					required group extra {
+						optional binary value;
 						optional group typed_value (LIST) {
 							repeated group list {
 								required group element {
+									optional binary value;
 									optional group typed_value {
 										required group name {
-											optional binary typed_value (STRING);
 											optional binary value;
+											optional binary typed_value (STRING);
 										}
 										required group num {
-											optional int64 typed_value (INT(64,true));
 											optional binary value;
+											optional int64 typed_value (INT(64,true));
 										}
 									}
-									optional binary value;
 								}
 							}
 						}
-						optional binary value;
 					}
 					required group id {
-						optional binary typed_value (STRING);
 						optional binary value;
+						optional binary typed_value (STRING);
 					}
 					required group tags {
+						optional binary value;
 						optional group typed_value (LIST) {
 							repeated group list {
 								required group element {
-									optional binary typed_value (STRING);
 									optional binary value;
+									optional binary typed_value (STRING);
 								}
 							}
 						}
-						optional binary value;
 					}
 				}
-				optional binary value;
 			}
 			optional group int16 (VARIANT) {
 				required binary metadata;
-				optional int32 typed_value (INT(16,true));
 				optional binary value;
+				optional int32 typed_value (INT(16,true));
 			}
 			optional group int32 (VARIANT) {
 				required binary metadata;
-				optional int32 typed_value (INT(32,true));
 				optional binary value;
+				optional int32 typed_value (INT(32,true));
 			}
 			optional group int64 (VARIANT) {
 				required binary metadata;
-				optional int64 typed_value (INT(64,true));
 				optional binary value;
+				optional int64 typed_value (INT(64,true));
 			}
 			optional group int8 (VARIANT) {
 				required binary metadata;
-				optional int32 typed_value (INT(8,true));
 				optional binary value;
+				optional int32 typed_value (INT(8,true));
 			}
 			optional group list (VARIANT) {
 				required binary metadata;
+				optional binary value;
 				optional group typed_value (LIST) {
 					repeated group list {
 						required group element {
-							optional binary typed_value (STRING);
 							optional binary value;
+							optional binary typed_value (STRING);
 						}
 					}
 				}
-				optional binary value;
 			}
 			optional group string (VARIANT) {
 				required binary metadata;
-				optional binary typed_value (STRING);
 				optional binary value;
+				optional binary typed_value (STRING);
 			}
 			optional group time (VARIANT) {
 				required binary metadata;
-				optional int64 typed_value (TIME(isAdjustedToUTC=true,unit=MICROS));
 				optional binary value;
+				optional int64 typed_value (TIME(isAdjustedToUTC=true,unit=MICROS));
 			}
 			optional group timestamp (VARIANT) {
 				required binary metadata;
-				optional int64 typed_value (TIMESTAMP(isAdjustedToUTC=true,unit=MICROS));
 				optional binary value;
+				optional int64 typed_value (TIMESTAMP(isAdjustedToUTC=true,unit=MICROS));
 			}
 			optional group uuid (VARIANT) {
 				required binary metadata;
-				optional fixed_len_byte_array(16) typed_value (UUID);
 				optional binary value;
+				optional fixed_len_byte_array(16) typed_value (UUID);
 			}
 		}
 		optional group unshredded (VARIANT) {
